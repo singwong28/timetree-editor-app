@@ -1,56 +1,84 @@
 import streamlit as st
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 import re
 
-st.title("TimeTree 編更表轉換器")
+# ---------- 設定範圍及授權 ----------
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_dict(st.secrets["gcp_service_account"], scope)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(st.secrets["SHEET_ID"]).worksheet(st.secrets["SHEET_NAME"])
 
-text_input = st.text_area("請貼上 TimeTree 活動內容", height=300)
+# ---------- UI ----------
+st.title("🗓️ TimeTree 值班表轉換工具")
+url = st.text_input("請貼上 TimeTree 分享連結（例如：https://timetreeapp.com/calendars/xxxxx）")
 
-def parse_entry(text):
-    lines = text.split('\n')
-    date = ""
-    time_range = ""
-    people = ""
-    shift = "B"
+if url:
+    with st.spinner("讀取中..."):
 
-    for line in lines:
-        if "日期" in line:
-            date_match = re.search(r"\d{1,2}/\d{1,2}", line)
-            if date_match:
-                date = date_match.group()
-        if "時間" in line:
-            time_match = re.search(r"(\d{1,2}):?(\d{2})?-?(\d{1,2}):?(\d{2})?", line)
-            if time_match:
-                start_hour = int(time_match.group(1))
-                end_hour = int(time_match.group(3))
-                # 24hr to 12hr
-                if start_hour >= 12: start_hour -= 12
-                if end_hour >= 12: end_hour -= 12
-                time_range = f"{start_hour}-{end_hour}"
-        if "人數" in line or "位" in line:
-            ppl_match = re.search(r"(\d+位[^\s]*)", line)
-            if ppl_match:
-                people = ppl_match.group(1)
-        if "A+b" in line or "a+b" in line:
-            shift = "A+B"
-        elif "A" in line:
-            shift = "A"
-        elif "B" in line:
-            shift = "B"
+        # 計算日期範圍（今天到三週後的星期六）
+        today = datetime.today()
+        end_date = today + timedelta(weeks=3)
+        end_date += timedelta(days=(5 - end_date.weekday()) % 7)  # 下一個週六
 
-    if date and time_range:
-        return f"{date} {shift} {time_range} {people}"
-    else:
-        return ""
+        date_range = [(today + timedelta(days=i)).strftime("%-m/%-d") for i in range((end_date - today).days + 1)]
 
-if st.button("轉換"):
-    results = []
-    chunks = text_input.split("晶晶")  # 根據你提供的原始資料格式分段
-    for chunk in chunks:
-        result = parse_entry(chunk)
-        if result:
-            results.append(result)
-    if results:
-        st.success("轉換成功！")
-        st.code("\n".join(results), language='text')
-    else:
-        st.warning("找不到可轉換內容，請檢查格式。")
+        # 儲存結果
+        results = []
+
+        # 嘗試抓頁面
+        try:
+            res = requests.get(url)
+            soup = BeautifulSoup(res.text, 'html.parser')
+
+            # 找出所有事件文字
+            raw_text = soup.get_text()
+
+            # 對每一天進行搜尋
+            for d in date_range:
+                pattern = re.compile(rf"{d}.*?(?=\d+/|\Z)", re.DOTALL)
+                matches = pattern.findall(raw_text)
+
+                for match in matches:
+                    if re.search(r"\b(A|B)\b", match):  # A / B 場地
+                        line = match.strip().replace("\n", " ")
+
+                        # 擷取時間
+                        time_match = re.search(r"(\d{1,2})[:\-\.](\d{1,2})", line)
+                        time_text = ""
+                        if time_match:
+                            h1, h2 = time_match.groups()
+                            time_text = f"{h1.zfill(2)}-{h2.zfill(2)}"
+
+                        # 擷取人數（30+ 才寫出來）
+                        people_match = re.search(r"(\d{2,})\s*位", line)
+                        people_text = ""
+                        if people_match and int(people_match.group(1)) > 30:
+                            people_text = f"{int(people_match.group(1))}位"
+
+                        # 場地（A or B）
+                        location = "A" if "A" in line else "B"
+
+                        # 最終格式
+                        formatted = f"{d} {location} {time_text}".strip()
+                        if people_text:
+                            formatted += f" {people_text}"
+                        results.append([formatted])
+
+        except Exception as e:
+            st.error("❌ 讀取失敗：" + str(e))
+
+        # 顯示 + 寫入
+        if results:
+            st.success(f"找到 {len(results)} 條資料，已寫入 Google Sheets ✅")
+            for r in results:
+                st.write(r[0])
+
+            sheet.clear()
+            sheet.append_rows([["日期與排班資訊"]])  # 標題列
+            sheet.append_rows(results)
+        else:
+            st.warning("沒有找到任何符合的事件 🙁")
