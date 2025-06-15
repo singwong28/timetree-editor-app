@@ -1,4 +1,5 @@
 streamlit
 gspread
-oauth2client
+google-auth
 beautifulsoup4
+selenium
