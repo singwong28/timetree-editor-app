@@ -1,79 +1,91 @@
 import streamlit as st
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import requests
+from google.oauth2.service_account import Credentials
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-import re
 
-# ---------- Google Sheets 授權 ----------
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_dict(
-    st.secrets["GOOGLE_SHEETS_CREDENTIALS"], scope)
-client = gspread.authorize(creds)
-sheet = client.open_by_key(st.secrets["SHEET_ID"]).worksheet(st.secrets["SHEET_NAME"])
+def fetch_timetree_html(email, password, calendar_id):
+    """Login to TimeTree and fetch rendered calendar page HTML."""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    driver = webdriver.Chrome(options=options)
 
-# ---------- Streamlit UI ----------
-st.title("📆 TimeTree ➜ Google Sheets 編更工具")
+    try:
+        driver.get("https://timetreeapp.com/signin")
+        
+        email_field = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.NAME, "email")))
+        password_field = driver.find_element(By.NAME, "current-password")
+        email_field.send_keys(email)
+        password_field.send_keys(password)
 
-url = st.text_input("請貼上 TimeTree 分享連結（例如：https://timetreeapp.com/calendars/xxxxx）")
+        password_field.submit()
+        
+        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".calendar-item")))
+        
+        driver.get(f"https://timetreeapp.com/calendars/{calendar_id}")
+        WebDriverWait(driver, 10).until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".event-item")))
 
-if url:
-    with st.spinner("⏳ 正在讀取 TimeTree 資料..."):
+        rendered_html = driver.page_source
+        return rendered_html
+    
+    except Exception as e:
+        st.error(f"登入或取得日曆時發生錯誤: {e}")
+        return ""
+    finally:
+        driver.quit()
 
-        today = datetime.today()
-        end_date = today + timedelta(weeks=3)
-        end_date += timedelta(days=(5 - end_date.weekday()) % 7)  # 補到最近週六
 
-        date_range = [(today + timedelta(days=i)).strftime("%-m/%-d") for i in range((end_date - today).days + 1)]
-        results = []
+def parse_timetree_html(html):
+    """解析渲染後HTML，整理出需要的数据。 """
+    soup = BeautifulSoup(html, "html.parser")
+    events = []
+    for item in soup.select('.event-item'):
+        time = item.select_one('.time').get_text(strip=True) if item.select_one('.time') else ''
+        name = item.select_one('.name').get_text(strip=True) if item.select_one('.name') else ''
+        events.append([time, name])
 
-        try:
-            res = requests.get(url)
-            soup = BeautifulSoup(res.text, "html.parser")
-            raw_text = soup.get_text()
+    return events
 
-            for d in date_range:
-                pattern = re.compile(rf"{d}.*?(?=\d{{1,2}}/\d{{1,2}}|\Z)", re.DOTALL)
-                matches = pattern.findall(raw_text)
 
-                for match in matches:
-                    if re.search(r"\b(A|B)\b", match):
-                        line = match.strip().replace("\n", " ")
+def write_to_sheets(events, credentials_file, sheet_key, sheet_name):
+    """登入 Google Sheets，寫入整理出的 events。"""
+    creds = Credentials.from_service_account_file(credentials_file, ['https://www.googleapis.com/auth/spreadsheets'])
+    gc = gspread.authorize(creds)
+    sheet = gc.open_by_key(sheet_key).worksheet(sheet_name)
 
-                        # 場地
-                        location = "A" if "A" in line else "B"
+    sheet.clear()
+    sheet.append_row(['Time', 'Event Name'])
 
-                        # 時間擷取
-                        time_match = re.search(r"(\d{1,2})[:\-\.](\d{1,2})", line)
-                        time_text = ""
-                        if time_match:
-                            h1, h2 = time_match.groups()
-                            time_text = f"{h1.zfill(2)}-{h2.zfill(2)}"
+    for event in events:
+        sheet.append_row(event)
 
-                        # 人數
-                        people_match = re.search(r"(\d{2,})\s*位", line)
-                        people_text = ""
-                        if people_match and int(people_match.group(1)) > 30:
-                            people_text = f"{int(people_match.group(1))}位"
+    return "寫入成功!"
 
-                        # 組合格式
-                        summary = f"{d} {location} {time_text}".strip()
-                        if people_text:
-                            summary += f" {people_text}"
-                        results.append([summary])
+def main():
+    st.title("📆 TimeTree To Google Sheets")
+    st.write("登入 TimeTree, 抓取日曆事件後寫入 Google Sheets")
 
-        except Exception as e:
-            st.error("❌ 無法讀取 TimeTree 資料：" + str(e))
+    if st.button("執行"):
+        email = st.secrets["EMAIL"]
+        password = st.secrets["PASSWORD"]
+        calendar_id = st.secrets["CALENDAR_ID"]
+        sheet_key = st.secrets["SHEET_ID"]
+        sheet_name = st.secrets["SHEET_NAME"]
+        credentials_file = "app/credentials/service_account.json"
 
-        if results:
-            st.success(f"✅ 成功讀取 {len(results)} 條活動資料，已寫入 Google Sheets！")
-            for r in results:
-                st.write(r[0])
-
-            # 寫入試算表
-            sheet.clear()
-            sheet.append_rows([["日期與排班資訊"]])
-            sheet.append_rows(results)
+        rendered = fetch_timetree_html(email, password, calendar_id)
+        if rendered:
+            events = parse_timetree_html(rendered)
+            if events:
+                result = write_to_sheets(events, credentials_file, sheet_key, sheet_name)
+                st.success(result)
+            else:
+                st.error("未找到任何事件")
         else:
-            st.warning("⚠️ 沒有找到任何活動資料")
+            st.error("登入 TimeTree 失敗")
+
+if __name__ == "__main__":
+    main()
